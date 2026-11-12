@@ -10,6 +10,7 @@ It walks through every required behavior:
   3. same version, different digest       -> REJECTED
   4. activation with a lost receipt       -> VERIFYING, then reconciled
   5. new upload while verification open   -> HTTP 409 (status still works)
+  6. timeout/retry with a late stale request interleave -> no downgrade
 """
 from __future__ import annotations
 
@@ -122,6 +123,60 @@ def main() -> int:
         print("  status query still works:", client.get(f"{API}/health").json())
         client.post(f"{API}/installations/reconcile")
         wait_terminal(client, t4)
+
+        log("6) timeout/retry + LATE stale request interleave (anti-downgrade)")
+        # The device pauses the FIRST v10 request AFTER its version check. The
+        # pause is one-shot and longer than the API timeout, so the API gives
+        # up (VERIFYING) while the request is still held, then reconciliation
+        # retries the original package.
+        delay = int(os.environ.get("RACE_ACTIVATION_DELAY", "5"))
+        armed = client.post(
+            f"{DEVICE}/admin/activation-delay",
+            json={"seconds": delay, "one_shot": True},
+        ).json()
+        print("  armed activation delay:", armed)
+
+        t10 = submit(client, package(10)).json()["task_id"]
+        for _ in range(40):
+            view = client.get(f"{API}/installations/{t10}").json()
+            if view["state"] == "VERIFYING":
+                break
+            time.sleep(0.25)
+        print(
+            "  task",
+            t10,
+            "->",
+            view["state"],
+            "(API timed out; the device still holds the paused request)",
+        )
+        print("  device still at v", client.get(f"{DEVICE}/status").json()["version"])
+
+        # While the stale request is paused, reconcile resends the ORIGINAL
+        # stored package. The retry is not delayed (one-shot consumed) and
+        # installs v10.
+        client.post(f"{API}/installations/reconcile")
+        wait_terminal(client, t10)
+        print("  after retry, device at v", client.get(f"{DEVICE}/status").json()["version"])
+
+        # A newer v11 activates before the paused first v10 request resumes.
+        t11 = submit(client, package(11)).json()["task_id"]
+        wait_terminal(client, t11)
+
+        # The first v10 request now resumes: it must be refused, never applied.
+        time.sleep(delay + 1)
+        final = client.get(f"{DEVICE}/status").json()
+        print("  device final version:", final["version"], "(must stay 11)")
+        assert final["version"] == 11, "stale request downgraded the device"
+        events = [
+            e["event"]
+            for e in client.get(f"{DEVICE}/admin/install-journal").json()["entries"]
+        ]
+        assert "rejected_stale_after_wait" in events
+        print("  device journal: the late request was -> rejected_stale_after_wait")
+        # Task results match the device's real final state.
+        assert client.get(f"{API}/installations/{t10}").json()["state"] == "SUCCESS"
+        assert client.get(f"{API}/installations/{t11}").json()["state"] == "SUCCESS"
+        print("  both tasks report SUCCESS and the device genuinely ends on v11")
 
         log("final device state + task list")
         print(json.dumps(client.get(f"{DEVICE}/status").json(), indent=2))

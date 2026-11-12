@@ -8,7 +8,9 @@
 #   2. same version + same digest -> idempotent original result
 #   3. same version + different digest -> REJECTED
 #   4. receipt lost after activation -> VERIFYING -> reconciled SUCCESS
-#   5. (manual) restart the API container -> open task preserved and recovered
+#   5. open task blocks new uploads (409); status queries stay available
+#   6. timeout/retry with a late stale request -> no downgrade, truthful receipt
+#   7. (manual) restart the API container -> open task preserved and recovered
 set -euo pipefail
 
 API="${API_URL:-http://localhost:8000}"
@@ -114,6 +116,38 @@ curl -fsS "$API/installations/$T4" | python3 -m json.tool
 log "reconcile recovers the v4 task"
 curl -fsS -X POST "$API/installations/reconcile" >/dev/null
 wait_terminal "$T4"
+
+# --- scenario 6: timeout/retry + late stale request (anti-downgrade) --------
+log "6) timeout/retry with a late stale request: the device must not downgrade"
+# The first v10 request pauses AFTER its version check, longer than the API
+# timeout. The pause is one-shot: the retry and v11 do not wait.
+RACE_DELAY="${RACE_ACTIVATION_DELAY:-5}"
+curl -fsS -X POST "$DEVICE/admin/activation-delay" \
+  -H 'Content-Type: application/json' \
+  -d "{\"seconds\": $RACE_DELAY, \"one_shot\": true}" | python3 -m json.tool
+sign 10 "$WORK/v10"
+T10="$(submit "$WORK/v10")"
+for _ in $(seq 1 20); do
+  STATE="$(curl -fsS "$API/installations/$T10" | python3 -c 'import sys,json;print(json.load(sys.stdin)["state"])')"
+  echo "  task $T10 state: $STATE"
+  [ "$STATE" = "VERIFYING" ] && break
+  sleep 1
+done
+echo "  device still at version: $(curl -fsS "$DEVICE/status" | python3 -c 'import sys,json;print(json.load(sys.stdin)["version"])')"
+# Reconcile resends the ORIGINAL package; the retry installs v10.
+curl -fsS -X POST "$API/installations/reconcile" >/dev/null
+wait_terminal "$T10"
+# v11 activates before the paused first v10 request resumes.
+sign 11 "$WORK/v11"
+T11="$(submit "$WORK/v11")"
+wait_terminal "$T11"
+# Let the late v10 request resume: it must be refused, never applied.
+sleep $((RACE_DELAY + 1))
+FINAL_VERSION="$(curl -fsS "$DEVICE/status" | python3 -c 'import sys,json;print(json.load(sys.stdin)["version"])')"
+echo "  device final version: $FINAL_VERSION (must be 11)"
+[ "$FINAL_VERSION" = "11" ] || { echo "FAIL: stale request downgraded the device" >&2; exit 1; }
+curl -fsS "$DEVICE/admin/install-journal" \
+  | python3 -c 'import sys,json; ev=[e["event"] for e in json.load(sys.stdin)["entries"]]; print("  late request classified as:", "rejected_stale_after_wait" if "rejected_stale_after_wait" in ev else ev)'
 
 log "final device state"
 curl -fsS "$DEVICE/status" | python3 -m json.tool

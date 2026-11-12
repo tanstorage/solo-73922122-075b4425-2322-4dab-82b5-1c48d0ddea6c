@@ -225,3 +225,32 @@ async def test_restart_with_uninstalled_device_resends(fresh_service, key_pair, 
     assert task["state"] == "SUCCESS"
     assert device.version == 12 and device.sha256 == sha
     await db2.close()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_resend_refused_when_device_newer_is_recorded_rejected(
+    fresh_service, key_pair
+):
+    """A late resend must not downgrade; the truthful rejection ends the task."""
+    svc, db, device = fresh_service
+    # First dispatch loses its receipt -> VERIFYING, but never activates.
+    device.lose_next = True
+    fw, mb, sig, _ = make_package(key_pair[0], version=8)
+    t = await svc.submit_installation(fw, mb, sig)
+    await _wait_state(db, t, "VERIFYING")
+
+    # While verification was open, a newer firmware got onto the device out of
+    # band (the equivalent of another install winning the interleave).
+    device.lose_next = False
+    device.version = 9
+    device.sha256 = "a" * 64
+
+    # Reconciliation resends the original v8 package; the device refuses it as
+    # a stale/downgrade request rather than rolling back.
+    await svc.reconcile()
+    task = await _wait_terminal(db, t)
+    assert task["state"] == "REJECTED"
+    assert device.version == 9  # never downgraded
+    # The slot is released again.
+    assert await db.get_open_task() is None
+

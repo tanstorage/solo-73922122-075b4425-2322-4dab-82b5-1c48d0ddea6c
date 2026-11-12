@@ -18,10 +18,12 @@
 | 同版同摘要返回原结果 | 查询设备确认 `(version, sha256)` 已安装 → 直接 SUCCESS（幂等，不重发字节） |
 | 同版异摘要拒绝 | API 预检与设备侧均拒绝，任务记 `REJECTED` |
 | 一次只执行一笔安装 | PENDING/DISPATCHED/VERIFYING 任一开放任务占用唯一槽位，新上传返回 `409` |
-| 结果未核实前拒绝新安装，但状态可查 | 槽位锁定期间 `GET` 状态查询与 `/health` 始终可用 |
+| 结果未核实前拒绝新安装，但状态可查 | 槽位锁定期间 `GET` 状态查询与 `/health` 始终可用；设备等待期间 `/status` 也不阻塞 |
 | 回执丢失/进程退出后保留原任务 | 固件与清单原始字节、签名整包持久化于 SQLite |
 | 重启先查设备：已安装补记成功，未安装重发原包 | 启动 `recover_on_startup` + 后台 `reconcile` 循环 + 手动 `POST /reconcile` |
 | 超时标为待核实，不能报失败或放行下一笔 | 设备不可达 → `VERIFYING`，槽位保持锁定，绝不置为失败 |
+| **迟到的旧请求不得降级已激活的新版本** | 设备侧安装串行锁 + 条件原子激活 `UPDATE ... WHERE version < ?`，激活前二次复核，旧请求被拒 |
+| **交错安装时回执对应本次实际结果** | 每个请求按其恢复时的最新状态分类：`installed` / `already_installed` / `rejected`，并在安装日志留痕 |
 
 ---
 
@@ -48,6 +50,45 @@
 
 ---
 
+## 2.1 安装竞争与迟到请求保护（本次修复重点）
+
+### 缺陷场景
+
+发布工程师连续升级时，设备模拟器原先在**版本检查通过后直接激活**，没有二次复核：
+
+1. 首笔 v2 请求通过版本检查后因网络变慢而**暂停**；
+2. API 等待超时，把任务置为 `VERIFYING` 并**重发 v2**，重发成功；
+3. 随后安装并激活 **v3**；
+4. 首笔（已迟到的）v2 请求恢复，按它记忆中的旧状态再次激活 → **设备被退回 v2**，
+   而 v3 任务仍显示 SUCCESS（任务结果与设备真实版本不一致）。
+
+### 修复机制（`device_sim/app.py`）
+
+设备对每笔 `/install` 做**两次状态观测**，并把最终激活做成受保护的条件更新：
+
+1. **版本检查（决策点 1）**：在进程内安装锁内读取当前版本，做降级 / 同版异摘要 /
+   同版同摘要判定；
+2. **可控激活延迟**：检查通过后、激活前，可暂停 N 秒（`POST /admin/activation-delay`，
+   支持 `one_shot`）。暂停期间**不持锁**，使超时重发与后续安装可以真正交错；
+3. **条件原子激活（决策点 2）**：重新获锁后执行
+   `UPDATE device_state SET version=? ... WHERE id=1 AND version < ?`。
+   条件不满足说明等待期间已有更新/同版本激活，本请求绝不覆盖；再按**此刻最新状态**
+   给出对应回执：
+   - 已是同版同摘要 → `already_installed`（幂等）；
+   - 同版异摘要 → `rejected`（409，禁止）；
+   - 当前版本更高（迟到旧请求）→ `rejected`（409，stale request refused）。
+
+由此保证：**旧请求不得覆盖已激活的新版本；同版异摘要拒绝；同版同摘要幂等；
+每笔回执只反映该请求本次的真实处理结果。** 单 worker 进程内由 `asyncio.Lock`
+串行化安装与出厂复位；`/status` 从不取锁，等待期间任务与设备状态仍可查询。
+设备还提供 `GET /admin/install-journal`，按时间顺序记录每笔请求的决策，便于核对交错过程。
+
+> 单 worker + 进程内锁是本模拟器明确的部署约定（Compose 即如此启动）。
+> 条件 `UPDATE ... WHERE version < ?` 本身在 SQLite 单库内也是原子的，
+> 即使将来放宽并发，激活的防降级语义依然成立。
+
+---
+
 ## 3. 目录结构
 
 ```
@@ -61,15 +102,15 @@
 │   ├── models.py           # Pydantic 响应模型
 │   └── main.py             # FastAPI 应用工厂与路由
 ├── device_sim/             # 网关设备模拟器（独立服务）
-│   └── app.py              # 版本/摘要原子切换、幂等、冲突、丢回执注入
+│   └── app.py              # 串行锁+条件原子激活、幂等/冲突/降级、激活延迟、丢回执、安装日志
 ├── keygen/generate_keys.py # 生成固定 Ed25519 信任锚（演示密钥对）
 ├── signing/                # 本地签名样例
 │   ├── sample_sign.py      # 构造固件+清单+签名
 │   └── verify_sample.py    # 仅用公钥离线验签
 ├── demo/
-│   ├── run_demo.py         # 容器内一键端到端演示客户端
+│   ├── run_demo.py         # 容器内一键端到端演示客户端（含超时重发+迟到请求交错）
 │   └── demo.sh             # 面向宿主机 curl 的演示脚本
-├── tests/                  # 20 个测试（校验/状态机/恢复/设备契约）
+├── tests/                  # 30 个测试（校验/状态机/恢复/设备契约/安装交错/真实套接字竞争）
 ├── Dockerfile.api
 ├── Dockerfile.device
 └── docker-compose.yml
@@ -83,7 +124,7 @@
 # 构建并启动：keygen（一次性生成密钥）→ device → api
 docker compose up --build
 
-# 另开一个终端，运行端到端演示（含丢回执、409、恢复）
+# 另开一个终端，运行端到端演示（含丢回执、409、恢复、超时重发+迟到请求交错）
 docker compose run --rm demo
 ```
 
@@ -166,9 +207,13 @@ python -m signing.verify_sample --keys-dir keys \
 
 设备模拟器管理接口（仅演示/测试用）：
 
+- `POST /admin/activation-delay`：设置“版本检查通过后、激活前”的暂停秒数；
+  `one_shot=true` 时仅对下一笔到达激活阶段的请求生效一次，用于复现超时重发交错。
+- `GET /admin/install-journal`：按时间顺序返回每笔安装请求的决策事件
+  （`installed` / `already_installed` / `rejected_stale_after_wait` 等）。
 - `POST /admin/lose-next-receipt`：下一笔真实激活后丢弃回执（模拟回执丢失）。
-- `POST /admin/reset`：恢复出厂版本与摘要。
-- `GET /status`：当前型号、版本、摘要、安装时间。
+- `POST /admin/reset`：恢复出厂版本与摘要，并清除故障注入与安装日志。
+- `GET /status`：当前型号、版本、摘要、安装时间（等待期间也不阻塞）。
 
 ---
 
@@ -185,6 +230,10 @@ python -m signing.verify_sample --keys-dir keys \
    保证“重发的是原包”。
 8. **单进程串行化 + SQLite 事务**：进程内用异步锁保证槽位检查与建任务原子；
    WAL 模式保证进程退出后状态可被新进程一致读取。
+9. **迟到请求防降级**：设备激活采用条件更新 `WHERE version < ?` 并在激活前二次复核，
+   请求暂停期间被更新版本抢先时，旧请求只收到拒绝回执而不会回退设备版本。
+10. **回执如实**：每笔请求按其真正生效时的最新状态返回 `installed` /
+    `already_installed` / `rejected`，任务结果与设备最终版本可对照、不串用别人的结果。
 
 ---
 
@@ -196,18 +245,25 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-覆盖内容（20 项）：
+覆盖内容（30 项）：
 
 - 坏签名、篡改清单、错误型号、摘要不符、非正整数/布尔版本、非法 JSON、超 8MiB；
 - 同版同摘要幂等、同版异摘要拒绝、降级拒绝；
 - 丢回执 → VERIFYING → 核实补记 SUCCESS；未安装 → 重发原包；
 - 设备持续不可达时始终 VERIFYING 且槽位不释放，恢复后完成原任务；
 - 模拟进程退出后新进程打开同一数据库的启动恢复（两条分支）；
-- 设备模拟器自身的幂等/冲突/降级/丢回执/摘要不符契约。
+- 设备模拟器自身的幂等/冲突/降级/丢回执/摘要不符契约；
+- **安装交错**：迟到旧请求不得降级、同版异摘要拒绝、同版同摘要幂等、
+  回执对应本次真实结果、等待期间 `/status` 可查、激活延迟可解除/复位清除；
+- **真实套接字端到端**：真实 uvicorn + 真实 httpx 超时，覆盖
+  “超时 → VERIFYING → 重发原包 → v3 → 迟到请求被拒”，并对照任务结果与设备最终版本；
+- 核实重发时设备已被更新版本占据 → 如实 `REJECTED` 且不降级、释放槽位。
 
 ---
 
-## 9. 配置项（环境变量，前缀 `FW_`）
+## 9. 配置项
+
+API 环境变量（前缀 `FW_`）：
 
 | 变量 | 默认值 | 含义 |
 | --- | --- | --- |
@@ -216,8 +272,18 @@ pytest -q
 | `FW_DEVICE_BASE_URL` | `http://device:8001` | 固定目标设备地址 |
 | `FW_DEVICE_MODEL` | `gateway-gx100` | 固定目标型号 |
 | `FW_MAX_FIRMWARE_BYTES` | `8388608` | 固件硬上限 8 MiB |
-| `FW_DEVICE_TIMEOUT_SECONDS` | `5.0` | 设备请求超时（超时即待核实） |
+| `FW_DEVICE_TIMEOUT_SECONDS` | `2.0`（Compose） | 设备请求超时（超时即待核实） |
 | `FW_RECONCILE_INTERVAL_SECONDS` | `3.0` | 后台核实循环间隔 |
+
+设备模拟器环境变量：
+
+| 变量 | 默认值 | 含义 |
+| --- | --- | --- |
+| `DEVICE_MODEL` | `gateway-gx100` | 固定设备型号 |
+| `DEVICE_DB_PATH` | `/data/device.db` | 设备状态 SQLite 路径 |
+| `DEVICE_FACTORY_VERSION` | `1` | 出厂版本 |
+| `DEVICE_FACTORY_DIGEST` | `00…01` | 出厂摘要 |
+| `DEVICE_ACTIVATION_DELAY` | `0` | 默认“检查后激活延迟”秒数；演示中也可用 `/admin/activation-delay` 动态设置 |
 
 > 演示密钥对仅用于本地/Compose。生产环境应将 Ed25519 私钥保存在离线签名系统，
 > 服务端只保留公钥。
